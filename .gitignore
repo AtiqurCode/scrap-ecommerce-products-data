@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local secrets (DB credentials, etc.) — copy .env.example instead
+.env
+
 # Scrape output + local dumps
 data/
 data_test*/
