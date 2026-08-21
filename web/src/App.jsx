@@ -65,7 +65,6 @@ export default function App() {
           message: event.message || prev?.message,
           current: event.current ?? prev?.current ?? 0,
           total: event.total ?? prev?.total,
-          filename: event.filename || prev?.filename,
           count: event.count ?? prev?.count,
           rowsWritten: event.rows_written ?? prev?.rowsWritten ?? 0,
         }))
@@ -88,7 +87,7 @@ export default function App() {
     <main className="shell">
       <header className="hero">
         <h1>Cartup scraper</h1>
-        <p>Paste a category, shop, or product URL. Data is saved to today’s CSV in chunks as it scrapes — download it anytime, no need to wait for the whole run.</p>
+        <p>Paste a category, shop, or product URL. Products save straight to the database as they scrape — download this run's rows as CSV anytime, no need to wait for the whole run.</p>
       </header>
 
       <form className="panel" onSubmit={generate}>
@@ -169,7 +168,7 @@ export default function App() {
               </a>
             </>
           ) : (
-            <p className="empty">Saving the first chunk to CSV…</p>
+            <p className="empty">Saving the first products to the database…</p>
           )}
         </section>
       ) : null}

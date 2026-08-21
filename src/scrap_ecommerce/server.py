@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import threading
 import uuid
@@ -9,14 +11,14 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from scrap_ecommerce.columns import PREFERRED_COLUMNS
 from scrap_ecommerce.scraper import CartupScraper, parse_target
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
 WEB_DIST = ROOT / "web" / "dist"
 
 app = FastAPI(title="Cartup Scraper")
@@ -37,6 +39,7 @@ class StartJobBody(BaseModel):
     url: str
     listing_only: bool = False
     max_products: int | None = Field(default=None, ge=1)
+    refresh: bool = False  # by default, products already saved are skipped, not re-fetched
 
 
 def _job(job_id: str) -> dict[str, Any]:
@@ -62,47 +65,38 @@ def _append(job: dict[str, Any], event: dict[str, Any]) -> None:
             job["rows_written"] = event["rows_written"]
         if event.get("type") == "done":
             job["status"] = "done"
-            job["csv"] = event.get("csv")
-            job["filename"] = event.get("filename")
             job["count"] = event.get("count", 0)
         elif event.get("type") == "error":
             job["status"] = "error"
             job["message"] = event.get("message") or "Scrape failed"
 
 
-def _run_job(job_id: str, url: str, listing_only: bool, max_products: int | None) -> None:
+def _run_job(job_id: str, url: str, listing_only: bool, max_products: int | None, refresh: bool) -> None:
     job = _job(job_id)
     if not _run_lock.acquire(blocking=False):
         _append(job, {"type": "error", "message": "Another scrape is already running"})
         return
+    scraper: CartupScraper | None = None
     try:
         scraper = CartupScraper(
-            out_dir=DATA_DIR,
             listing_only=listing_only,
             max_products=max_products,
+            skip_existing=not refresh,
             on_progress=lambda payload: _append(job, payload),
+            on_row=lambda row: job["rows"].append(row),
         )
-        job["csv"] = str(scraper.csv_path)
-        job["filename"] = scraper.csv_path.name
         scraper.scrape_url(url)
         with job["lock"]:
             if job["status"] == "running":
                 job["status"] = "done"
                 job["events"].append(
-                    {
-                        "type": "done",
-                        "count": job.get("count") or job.get("current") or 0,
-                        "csv": job.get("csv"),
-                        "filename": job.get("filename"),
-                    }
+                    {"type": "done", "count": job.get("count") or job.get("current") or 0}
                 )
     except Exception as exc:
         _append(job, {"type": "error", "message": str(exc)})
     finally:
-        try:
+        if scraper is not None:
             scraper.close()
-        except NameError:
-            pass
         _run_lock.release()
 
 
@@ -131,8 +125,7 @@ def start_job(body: StartJobBody) -> dict[str, Any]:
         "total": None,
         "count": 0,
         "rows_written": 0,
-        "csv": None,
-        "filename": None,
+        "rows": [],
         "events": [],
         "lock": threading.Lock(),
         "listing_only": body.listing_only,
@@ -141,7 +134,7 @@ def start_job(body: StartJobBody) -> dict[str, Any]:
         _jobs[job_id] = job
     thread = threading.Thread(
         target=_run_job,
-        args=(job_id, target["url"], body.listing_only, body.max_products),
+        args=(job_id, target["url"], body.listing_only, body.max_products, body.refresh),
         daemon=True,
     )
     thread.start()
@@ -162,7 +155,6 @@ def get_job(job_id: str) -> dict[str, Any]:
             "total": job["total"],
             "count": job["count"],
             "rows_written": job["rows_written"],
-            "filename": job["filename"],
         }
 
 
@@ -193,12 +185,24 @@ async def job_events(job_id: str) -> StreamingResponse:
 
 
 @app.get("/api/jobs/{job_id}/download")
-def download_csv(job_id: str) -> FileResponse:
+def download_csv(job_id: str) -> Response:
+    """Data lives in MySQL now — this exports the rows this job saved as a CSV on the
+    fly, so the UI's download button still works without ever persisting a CSV file."""
     job = _job(job_id)
-    path = Path(job["csv"] or "")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="CSV not ready yet")
-    return FileResponse(path, filename=path.name, media_type="text/csv")
+    with job["lock"]:
+        rows = list(job["rows"])
+    if not rows:
+        raise HTTPException(status_code=404, detail="No rows saved yet")
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=PREFERRED_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: "" if v is None else v for k, v in row.items()})
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="products_{job_id}.csv"'},
+    )
 
 
 if WEB_DIST.exists():
