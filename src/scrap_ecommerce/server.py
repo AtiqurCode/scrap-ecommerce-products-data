@@ -36,7 +36,7 @@ _run_lock = threading.Lock()
 
 
 class StartJobBody(BaseModel):
-    url: str
+    urls: list[str] = Field(min_length=1)
     listing_only: bool = False
     max_products: int | None = Field(default=None, ge=1)
     refresh: bool = False  # by default, products already saved are skipped, not re-fetched
@@ -63,15 +63,34 @@ def _append(job: dict[str, Any], event: dict[str, Any]) -> None:
             job["message"] = event["message"]
         if event.get("rows_written") is not None:
             job["rows_written"] = event["rows_written"]
-        if event.get("type") == "done":
+        etype = event.get("type")
+        if etype == "category_done":
+            job["reports"].append(
+                {
+                    "url": event.get("url"),
+                    "kind": event.get("kind"),
+                    "new": event.get("new", 0),
+                    "updated": event.get("updated", 0),
+                    "skipped": event.get("skipped", 0),
+                    "processed": event.get("processed", 0),
+                }
+            )
+        elif etype == "category_error":
+            job["reports"].append({"url": event.get("url"), "error": event.get("message")})
+        elif etype == "done":
             job["status"] = "done"
             job["count"] = event.get("count", 0)
-        elif event.get("type") == "error":
+            # the final "done" event carries the authoritative full report list —
+            # replace rather than append so nothing's duplicated with the incremental
+            # category_done/category_error entries added above during the run.
+            if event.get("reports") is not None:
+                job["reports"] = event["reports"]
+        elif etype == "error":
             job["status"] = "error"
             job["message"] = event.get("message") or "Scrape failed"
 
 
-def _run_job(job_id: str, url: str, listing_only: bool, max_products: int | None, refresh: bool) -> None:
+def _run_job(job_id: str, urls: list[str], listing_only: bool, max_products: int | None, refresh: bool) -> None:
     job = _job(job_id)
     if not _run_lock.acquire(blocking=False):
         _append(job, {"type": "error", "message": "Another scrape is already running"})
@@ -85,7 +104,7 @@ def _run_job(job_id: str, url: str, listing_only: bool, max_products: int | None
             on_progress=lambda payload: _append(job, payload),
             on_row=lambda row: job["rows"].append(row),
         )
-        scraper.scrape_url(url)
+        scraper.scrape_urls(urls)
         with job["lock"]:
             if job["status"] == "running":
                 job["status"] = "done"
@@ -107,17 +126,22 @@ def health() -> dict[str, str]:
 
 @app.post("/api/jobs")
 def start_job(body: StartJobBody) -> dict[str, Any]:
-    url = body.url.strip()
-    try:
-        target = parse_target(url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    urls = [u.strip() for u in body.urls if u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="Need at least one URL")
+    targets = []
+    for url in urls:
+        try:
+            targets.append(parse_target(url))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if _run_lock.locked():
         raise HTTPException(status_code=409, detail="A scrape is already running")
     job_id = uuid.uuid4().hex[:12]
+    clean_urls = [t["url"] for t in targets]
     job = {
         "id": job_id,
-        "url": target["url"],
+        "urls": clean_urls,
         "status": "running",
         "stage": "opening",
         "message": "Queued",
@@ -126,6 +150,7 @@ def start_job(body: StartJobBody) -> dict[str, Any]:
         "count": 0,
         "rows_written": 0,
         "rows": [],
+        "reports": [],
         "events": [],
         "lock": threading.Lock(),
         "listing_only": body.listing_only,
@@ -134,11 +159,11 @@ def start_job(body: StartJobBody) -> dict[str, Any]:
         _jobs[job_id] = job
     thread = threading.Thread(
         target=_run_job,
-        args=(job_id, target["url"], body.listing_only, body.max_products, body.refresh),
+        args=(job_id, clean_urls, body.listing_only, body.max_products, body.refresh),
         daemon=True,
     )
     thread.start()
-    return {"id": job_id, "url": target["url"]}
+    return {"id": job_id, "urls": clean_urls}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -147,7 +172,7 @@ def get_job(job_id: str) -> dict[str, Any]:
     with job["lock"]:
         return {
             "id": job["id"],
-            "url": job["url"],
+            "urls": job["urls"],
             "status": job["status"],
             "stage": job["stage"],
             "message": job["message"],
@@ -155,6 +180,7 @@ def get_job(job_id: str) -> dict[str, Any]:
             "total": job["total"],
             "count": job["count"],
             "rows_written": job["rows_written"],
+            "reports": list(job["reports"]),
         }
 
 
