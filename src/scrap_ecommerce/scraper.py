@@ -688,15 +688,18 @@ class CartupScraper:
     def close(self) -> None:
         db.close_current_connection()
 
-    def append_rows(self, rows: list[dict[str, Any]]) -> None:
+    def append_rows(self, rows: list[dict[str, Any]]) -> dict[str, int]:
         """Upsert rows into the `products` table immediately (as soon as that item's
         data is ready) rather than batching. Each worker thread has its own DB
         connection (see db.get_connection), so unlike the old CSV writer this doesn't
         need to serialize every row behind one global lock — MySQL handles the
-        concurrent writes; only the shared rows_written counter needs one."""
+        concurrent writes; only the shared rows_written counter needs one. Returns the
+        new/updated/unchanged breakdown from db.upsert_products so callers can build a
+        per-category report."""
         if not rows:
-            return
-        saved = db.upsert_products(rows)
+            return {"new": 0, "updated": 0, "unchanged": 0}
+        counts = db.upsert_products(rows)
+        saved = counts["new"] + counts["updated"] + counts["unchanged"]
         with self._rows_lock:
             self.rows_written += saved
             rows_written = self.rows_written
@@ -712,6 +715,7 @@ class CartupScraper:
             rows_written=rows_written,
             message=f"Saved — {rows_written} rows in the database",
         )
+        return counts
 
     def collect_listings(
         self,
@@ -992,7 +996,7 @@ class CartupScraper:
             )
 
         seen_known = set(already)
-        state = {"submitted": 0, "skipped": 0, "done": 0, "total": None}
+        state = {"submitted": 0, "skipped": 0, "done": 0, "new": 0, "updated": 0, "total": None}
         state_lock = threading.Lock()
 
         def effective_total() -> int | None:
@@ -1015,9 +1019,13 @@ class CartupScraper:
                 listing=item,
                 pdp=pdp,
             )
-            self.append_rows([row])
+            counts = self.append_rows([row])
             with state_lock:
                 state["done"] += 1
+                state["new"] += counts["new"]
+                # "updated" here means "already existed and we touched it again" —
+                # whether or not its values actually differed this time.
+                state["updated"] += counts["updated"] + counts["unchanged"]
                 current = state["done"]
             self._emit(
                 type="product",
@@ -1064,12 +1072,82 @@ class CartupScraper:
                 fut.result()
 
         done = state["done"]
-        print(f"  saved {done} rows to `{db.TABLE_NAME}`", flush=True)
+        new_count = state["new"]
+        updated_count = state["updated"]
+        skipped_count = state["skipped"]
+        print(
+            f"  [{target['kind']}] {target['url']}: {new_count} new, {updated_count} updated, "
+            f"{skipped_count} skipped ({done} processed)",
+            flush=True,
+        )
+        report = {
+            "url": target["url"],
+            "kind": target["kind"],
+            "new": new_count,
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "processed": done,
+        }
+        # "category_done" rather than "done" — a scrape_url() call is one category out
+        # of however many were queued for this job (see CartupScraper.scrape_urls /
+        # server.py's job loop), so it must not look like the whole job finished.
+        self._emit(
+            type="category_done",
+            rows_written=self.rows_written,
+            message=f"{target['url']}: {new_count} new, {updated_count} updated, {skipped_count} skipped",
+            **report,
+        )
+        return report
+
+    def scrape_urls(self, urls: list[str]) -> dict[str, Any]:
+        """Run each URL through scrape_url one at a time, in order — not in parallel,
+        since they share this scraper's listing-collection browser and DB connections.
+        Collects a new/updated/skipped report per category, and one final aggregated
+        "done" event/return value once all of them are finished. A category that
+        raises (bad URL, site error, etc.) is recorded as failed and does not stop the
+        rest of the queue from running."""
+        reports: list[dict[str, Any]] = []
+        for i, url in enumerate(urls, start=1):
+            self._emit(
+                type="status",
+                stage="opening",
+                message=f"Starting category {i}/{len(urls)}: {url}",
+            )
+            try:
+                report = self.scrape_url(url)
+            except Exception as exc:
+                report = {
+                    "url": url,
+                    "kind": "",
+                    "new": 0,
+                    "updated": 0,
+                    "skipped": 0,
+                    "processed": 0,
+                    "error": str(exc),
+                }
+                print(f"  [{url}] failed: {exc}", flush=True)
+                self._emit(type="category_error", url=url, message=f"{url} failed: {exc}")
+            reports.append(report)
+
+        totals = {
+            "new": sum(r.get("new", 0) for r in reports),
+            "updated": sum(r.get("updated", 0) for r in reports),
+            "skipped": sum(r.get("skipped", 0) for r in reports),
+            "processed": sum(r.get("processed", 0) for r in reports),
+        }
+        failed = sum(1 for r in reports if r.get("error"))
+        message = (
+            f"Done — {totals['new']} new, {totals['updated']} updated, {totals['skipped']} skipped "
+            f"across {len(urls)} categor{'y' if len(urls) == 1 else 'ies'}"
+        )
+        if failed:
+            message += f" ({failed} failed)"
         self._emit(
             type="done",
-            count=done,
+            count=totals["processed"],
             rows_written=self.rows_written,
-            message=f"Saved {done} rows to the database",
+            reports=reports,
+            message=message,
         )
-        return {"count": done, "table": db.TABLE_NAME}
+        return {"reports": reports, "totals": totals}
 

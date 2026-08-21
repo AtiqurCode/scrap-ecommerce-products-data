@@ -45,14 +45,22 @@ def main() -> None:
         headful=args.headful,
         skip_existing=not args.refresh,
     )
-    total = 0
     try:
-        for url in urls:
-            result = scraper.scrape_url(url)
-            total += result.get("count", 0)
+        result = scraper.scrape_urls(urls)
     finally:
         scraper.close()
-    print(f"\nDone.\nSaved {total} rows to the `products` table.")
+
+    totals = result["totals"]
+    print(f"\nDone — {len(urls)} categor{'y' if len(urls) == 1 else 'ies'} processed.")
+    print(f"  {totals['new']} new, {totals['updated']} updated, {totals['skipped']} skipped")
+    for report in result["reports"]:
+        if report.get("error"):
+            print(f"  ✗ {report['url']}: failed — {report['error']}")
+        else:
+            print(
+                f"  ✓ {report['url']}: {report['new']} new, {report['updated']} updated, "
+                f"{report['skipped']} skipped"
+            )
 
 
 if __name__ == "__main__":
