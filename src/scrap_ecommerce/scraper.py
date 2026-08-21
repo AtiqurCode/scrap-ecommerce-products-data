@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import http.client
 import json
 import random
@@ -9,9 +8,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+from scrap_ecommerce import db
 
 SITE = "https://cartup.com"
 API_HOST = "https://api.cartup.com"
@@ -48,56 +48,6 @@ LISTING_API_HINTS = (
     "get-category-wise",
 )
 
-PREFERRED_COLUMNS = [
-    "scraped_at",
-    "source_url",
-    "page_type",
-    "category_slug",
-    "shop_slug",
-    "url",
-    "product_id",
-    "variant_id",
-    "name",
-    "slug",
-    "sku",
-    "shop_sku",
-    "seller_sku",
-    "brand",
-    "brand_id",
-    "category",
-    "category_id",
-    "seller_name",
-    "seller_id",
-    "shop_name",
-    "shop_url",
-    "price",
-    "original_price",
-    "discount_percentage",
-    "currency",
-    "stock",
-    "availability",
-    "rating",
-    "rating_count",
-    "warranty",
-    "warranty_period",
-    "return_option",
-    "free_shipping",
-    "is_cartup_fast",
-    "is_best_seller",
-    "highlight",
-    "box_items",
-    "description",
-    "images",
-    "thumbnail",
-    "video_url",
-    "package_weight_kg",
-    "package_height_cm",
-    "package_width_cm",
-    "package_length_cm",
-    "variants_json",
-    "attributes_json",
-    "product_json",
-]
 
 
 def now_iso() -> str:
@@ -692,30 +642,28 @@ def listing_size_patch(rows: int) -> str:
 class CartupScraper:
     def __init__(
         self,
-        out_dir: Path,
         workers: int = 16,
         delay: float = 0.04,
         rows_per_page: int = 30,
         max_products: int | None = None,
         listing_only: bool = False,
         headful: bool = False,
+        skip_existing: bool = True,
         on_progress: Any | None = None,
+        on_row: Any | None = None,
     ) -> None:
-        self.out_dir = out_dir
         self.workers = max(1, workers)
         self.delay = delay
         self.rows_per_page = max(1, min(int(rows_per_page), LISTING_PAGE_CAP))
         self.max_products = max_products
         self.listing_only = listing_only
         self.headful = headful
+        self.skip_existing = skip_existing
         self.on_progress = on_progress
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.on_row = on_row
         self.date = today_stamp()
-        self.csv_path = self.out_dir / f"cartup_{self.date}.csv"
         self.rows_written = 0
-        self._csv_lock = threading.Lock()
-        self._csv_file: Any = None
-        self._csv_writer: csv.DictWriter | None = None
+        self._rows_lock = threading.Lock()
         self._listing_lock = threading.Lock()
 
     def _emit(self, **payload: Any) -> None:
@@ -728,62 +676,41 @@ class CartupScraper:
             pass
 
     def known_urls(self) -> set[str]:
-        if not self.csv_path.exists():
+        """URLs already saved in the `products` table. Matches the old CSV's default:
+        a product you've already scraped is left alone on a re-run, not re-fetched.
+        Unlike the CSV (a fresh file every day, so everything got re-scraped daily
+        regardless), the `products` table is permanent — skip_existing=False (--refresh)
+        opts back into re-fetching and updating products you already have."""
+        if not self.skip_existing:
             return set()
-        urls: set[str] = set()
-        with self.csv_path.open(newline="", encoding="utf-8-sig") as fh:
-            for row in csv.DictReader(fh):
-                url = row.get("url")
-                if url:
-                    urls.add(url)
-        return urls
+        return db.existing_urls()
 
     def close(self) -> None:
-        """Release the persistent CSV handle. Safe to call multiple times; a plain
-        process exit would close it anyway, but the web server keeps one scraper
-        instance alive per job so this avoids leaking handles across jobs."""
-        with self._csv_lock:
-            if self._csv_file is not None:
-                try:
-                    self._csv_file.close()
-                except Exception:
-                    pass
-                self._csv_file = None
-                self._csv_writer = None
-
-    def _ensure_csv_writer(self) -> None:
-        if self._csv_writer is not None:
-            return
-        write_header = (not self.csv_path.exists()) or self.csv_path.stat().st_size == 0
-        self._csv_file = self.csv_path.open("a", newline="", encoding="utf-8-sig")
-        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=PREFERRED_COLUMNS, extrasaction="ignore")
-        if write_header:
-            self._csv_writer.writeheader()
-            self._csv_file.flush()
+        db.close_current_connection()
 
     def append_rows(self, rows: list[dict[str, Any]]) -> None:
-        """Write rows to disk immediately and flush. Called per-item (as soon as that
-        item's data is ready) rather than in big batches, and guarded by a lock since
-        listing pagination and multiple product-detail workers can call this concurrently.
-        Keeps one file handle open for the scraper's lifetime instead of reopening the
-        CSV on every row — with 10k-30k+ rows that reopen was real, avoidable overhead
-        serialized behind the same lock every worker thread waits on."""
+        """Upsert rows into the `products` table immediately (as soon as that item's
+        data is ready) rather than batching. Each worker thread has its own DB
+        connection (see db.get_connection), so unlike the old CSV writer this doesn't
+        need to serialize every row behind one global lock — MySQL handles the
+        concurrent writes; only the shared rows_written counter needs one."""
         if not rows:
             return
-        with self._csv_lock:
-            self._ensure_csv_writer()
-            assert self._csv_writer is not None and self._csv_file is not None
-            for row in rows:
-                self._csv_writer.writerow({k: "" if v is None else v for k, v in row.items()})
-            self._csv_file.flush()
-            self.rows_written += len(rows)
+        saved = db.upsert_products(rows)
+        with self._rows_lock:
+            self.rows_written += saved
             rows_written = self.rows_written
+        if self.on_row:
+            for row in rows:
+                try:
+                    self.on_row(row)
+                except Exception:
+                    pass
         self._emit(
             type="chunk",
             stage="details",
             rows_written=rows_written,
-            filename=self.csv_path.name,
-            message=f"Saved — {rows_written} rows on disk",
+            message=f"Saved — {rows_written} rows in the database",
         )
 
     def collect_listings(
@@ -1049,22 +976,19 @@ class CartupScraper:
 
     def scrape_url(self, raw_url: str) -> dict[str, Any]:
         """Stream listings straight into per-item saves: each item is handed to a worker
-        the moment its listing page arrives, so a product can be fetched and written to
-        CSV while later pagination pages are still loading — first come, first served,
-        rather than collecting the whole listing before any row is saved."""
+        the moment its listing page arrives, so a product can be fetched and upserted
+        into the database while later pagination pages are still loading — first come,
+        first served, rather than collecting the whole listing before any row is saved."""
         target = parse_target(raw_url)
         print(f"\n[{target['kind']}] {target['url']}")
         self._emit(type="status", stage="opening", message=f"Opening {target['kind']} page…")
 
         already = self.known_urls()
-        self.rows_written = len(already)
         if already:
             self._emit(
-                type="chunk",
+                type="status",
                 stage="details",
-                rows_written=self.rows_written,
-                filename=self.csv_path.name,
-                message=f"Resuming — {self.rows_written} rows already on disk",
+                message=f"Resuming — {len(already)} products already saved, skipping",
             )
 
         seen_known = set(already)
@@ -1127,7 +1051,7 @@ class CartupScraper:
             count, total = self.collect_listings(target, on_item=on_item, on_total=on_total)
             print(f"  listing items: {count}" + (f" / {total}" if total else ""), flush=True)
             if state["skipped"]:
-                print(f"  resume skip: {state['skipped']} already in today's file")
+                print(f"  skip-existing: {state['skipped']} already in the database")
             self._emit(
                 type="status",
                 stage="details",
@@ -1140,14 +1064,12 @@ class CartupScraper:
                 fut.result()
 
         done = state["done"]
-        print(f"  saved {self.csv_path.name} ({done} new rows)", flush=True)
+        print(f"  saved {done} rows to `{db.TABLE_NAME}`", flush=True)
         self._emit(
             type="done",
             count=done,
             rows_written=self.rows_written,
-            csv=str(self.csv_path),
-            filename=self.csv_path.name,
-            message=f"Saved {done} rows to {self.csv_path.name}",
+            message=f"Saved {done} rows to the database",
         )
-        return {"count": done, "csv": str(self.csv_path)}
+        return {"count": done, "table": db.TABLE_NAME}
 

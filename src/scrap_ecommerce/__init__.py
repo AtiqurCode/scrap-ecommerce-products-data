@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 from scrap_ecommerce.scraper import CartupScraper
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scrape Cartup category/shop/product URLs into a same-date CSV."
+        description="Scrape Cartup category/shop/product URLs into the `products` MySQL table."
     )
     parser.add_argument("urls", nargs="*", help="Cartup /category/, /shop/, or /product/ URLs")
-    parser.add_argument("-o", "--out-dir", default="data", help="Output folder (default: data)")
     parser.add_argument("--max-products", type=int, default=None, help="Stop after N products (debug)")
     parser.add_argument("--listing-only", action="store_true", help="Skip product-page details")
     parser.add_argument("--workers", type=int, default=16, help="PDP fetch workers")
     parser.add_argument("--delay", type=float, default=0.04, help="Delay between requests (seconds)")
     parser.add_argument("--rows-per-page", type=int, default=30)
     parser.add_argument("--headful", action="store_true", help="Show Chrome while collecting listings")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Re-fetch and update products already saved in the database (default: skip them, like the old CSV did each day)",
+    )
     args = parser.parse_args()
 
     try:
@@ -34,20 +37,22 @@ def main() -> None:
         urls = [raw]
 
     scraper = CartupScraper(
-        out_dir=Path(args.out_dir),
         workers=args.workers,
         delay=args.delay,
         rows_per_page=args.rows_per_page,
         max_products=args.max_products,
         listing_only=args.listing_only,
         headful=args.headful,
+        skip_existing=not args.refresh,
     )
+    total = 0
     try:
         for url in urls:
-            scraper.scrape_url(url)
+            result = scraper.scrape_url(url)
+            total += result.get("count", 0)
     finally:
         scraper.close()
-    print(f"\nDone.\nCSV : {scraper.csv_path}")
+    print(f"\nDone.\nSaved {total} rows to the `products` table.")
 
 
 if __name__ == "__main__":
