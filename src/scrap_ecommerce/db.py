@@ -259,28 +259,47 @@ def ensure_schema() -> None:
         _schema_ready = True
 
 
+# Deliberately does NOT set `updated_at` explicitly here — the column's own
+# `ON UPDATE CURRENT_TIMESTAMP` already bumps it, but only when some other column's
+# value actually changes. Setting it explicitly here would make MySQL treat every
+# re-scrape as a change (see rowcount note in upsert_products below), even when
+# nothing about the product actually changed.
 _UPSERT_SQL = (
     f"INSERT INTO `{TABLE_NAME}` ({', '.join(f'`{c}`' for c in PREFERRED_COLUMNS)}) "
     f"VALUES ({', '.join(['%s'] * len(PREFERRED_COLUMNS))}) "
     "ON DUPLICATE KEY UPDATE "
     + ", ".join(f"`{c}`=VALUES(`{c}`)" for c in PREFERRED_COLUMNS if c != "url")
-    + ", `updated_at`=CURRENT_TIMESTAMP"
 )
 
 
-def upsert_products(rows: list[dict[str, Any]]) -> int:
+def upsert_products(rows: list[dict[str, Any]]) -> dict[str, int]:
     """Insert rows, or update the existing row for the same `url` (the table keeps one
     current row per product — re-scraping refreshes price/stock/etc. instead of piling
-    up duplicates). Rows without a usable url are skipped since url is the unique key."""
+    up duplicates). Rows without a usable url are skipped since url is the unique key.
+
+    Returns a {"new": n, "updated": n, "unchanged": n} breakdown using MySQL's own
+    per-statement affected-rows count for INSERT ... ON DUPLICATE KEY UPDATE: 1 row
+    affected means the url was inserted fresh, 2 means an existing row's values
+    actually changed, 0 means the url already existed with these exact values. That's
+    why each row is executed individually rather than batched — batching into one
+    multi-row statement would only give a single summed count, not a per-row one."""
     usable = [row for row in rows if str(row.get("url") or "").strip()]
+    counts = {"new": 0, "updated": 0, "unchanged": 0}
     if not usable:
-        return 0
+        return counts
     ensure_schema()
-    values = [tuple(_coerce_value(col, row.get(col)) for col in PREFERRED_COLUMNS) for row in usable]
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.executemany(_UPSERT_SQL, values)
-    return len(usable)
+        for row in usable:
+            values = tuple(_coerce_value(col, row.get(col)) for col in PREFERRED_COLUMNS)
+            cur.execute(_UPSERT_SQL, values)
+            if cur.rowcount == 1:
+                counts["new"] += 1
+            elif cur.rowcount == 2:
+                counts["updated"] += 1
+            else:
+                counts["unchanged"] += 1
+    return counts
 
 
 def existing_urls() -> set[str]:
