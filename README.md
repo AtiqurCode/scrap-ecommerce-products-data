@@ -1,6 +1,21 @@
 # Cartup scraper
 
-Scrape Cartup category / shop / product pages into a **same-date CSV**.
+Scrape Cartup category / shop / product pages straight into a **MySQL `products` table**.
+
+## Database setup
+
+Copy `.env.example` to `.env` and fill in your MySQL credentials:
+
+```
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=scrap_ecommerce
+DB_USERNAME=root
+DB_PASSWORD=
+```
+
+The database and the `products` table are created automatically on first run if they don't exist yet — no migration step needed. `url` is the unique key, so a product can never end up duplicated in the table. By default, a product already saved is left alone on a later run (same as the old CSV skipping already-scraped URLs) — pass `--refresh` if you want to re-fetch and update it instead.
 
 ## UI
 
@@ -16,7 +31,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 — paste a Cartup URL, click **Generate**, watch products complete one by one. CSV downloads when the job finishes.
+Open http://localhost:5173 — paste a Cartup URL, click **Generate**, watch products complete one by one as they're saved to MySQL. A CSV of just this run's rows is available to download once rows start landing.
 
 `Listing only` is on by default (faster). Uncheck it to fetch full product-page details.
 
@@ -40,7 +55,7 @@ No URL → it prompts:
 uv run python scrape.py
 ```
 
-Multiple URLs (same day = same CSV, deduped by product URL):
+Multiple URLs (dedup is by product URL, across all of them):
 
 ```bash
 uv run python scrape.py "https://cartup.com/category/laptops" "https://cartup.com/category/gaming_laptops"
@@ -54,15 +69,11 @@ Supported URLs:
 
 ## Output
 
-Written to `data/` (override with `-o`):
+Every scraped product is saved into the `products` table (flattened columns — name, price, original price, discount, brand, shop, sku, stock, rating, description, images, … — plus a `product_json` column with the full product object).
 
-`data/cartup_YYYY-MM-DD.csv`
+By default, products already in the table are skipped — not re-fetched, not touched — same behavior as the old CSV's "already-scraped URLs are skipped." The one difference: the CSV started a fresh file every day, so everything naturally got re-scraped the next day; the `products` table is permanent, so a skipped product stays as-is forever unless you ask otherwise. Pass `--refresh` to re-fetch and update products you already have (price/stock changes, etc.) instead of skipping them.
 
-Flattened columns (name, price, original price, discount, brand, shop, sku, stock, rating, description, images, …) plus a `product_json` column with the full product object.
-
-Re-run the same day: already-scraped URLs are skipped.
-
-Ctrl+C flushes whatever is already saved.
+Ctrl+C is safe: whatever's already been saved stays saved (each product is committed to MySQL as soon as it's fetched, nothing is buffered and lost).
 
 Full category scrapes are slow if you fetch every product page. Faster:
 
@@ -82,17 +93,17 @@ uv run python scrape.py "https://cartup.com/category/computers__laptops" --listi
 uv run python scrape.py "https://cartup.com/category/computers__laptops" --max-products 50
 uv run python scrape.py "https://cartup.com/category/computers__laptops" --workers 8 --delay 0.08
 uv run python scrape.py "https://cartup.com/category/computers__laptops" --headful
-uv run python scrape.py "https://cartup.com/category/computers__laptops" -o data
+uv run python scrape.py "https://cartup.com/category/computers__laptops" --refresh
 ```
 
 | Flag | Default | |
 | --- | --- | --- |
-| `-o`, `--out-dir` | `data` | Output folder |
 | `--listing-only` | off | Skip product-page details (faster, fewer columns) |
 | `--max-products N` | all | Stop after N products |
 | `--workers` | `16` | Parallel product-page fetches |
 | `--delay` | `0.04` | Seconds between product-page requests |
 | `--rows-per-page` | `30` | Listing page size (Cartup caps at 30) |
 | `--headful` | off | Show Chrome while collecting listings |
+| `--refresh` | off | Re-fetch and update products already saved instead of skipping them |
 
 Category pages with ~16k items take a while: listings first (Load More), then one request per product page.
