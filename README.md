@@ -31,7 +31,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 — paste a Cartup URL, click **Generate**, watch products complete one by one as they're saved to MySQL. A CSV of just this run's rows is available to download once rows start landing.
+Open http://localhost:5173 — paste one or more Cartup URLs (one per line), click **Generate**. Categories run one after another in the same job and save straight to MySQL as they go. Each category gets its own report card the moment it finishes — how many products were new, how many were updated, how many were already saved and skipped — and a CSV of everything this job saved is available to download once rows start landing.
 
 `Listing only` is on by default (faster). Uncheck it to fetch full product-page details.
 
@@ -46,7 +46,7 @@ Then `uv run scrape-ui` also serves the built UI at http://127.0.0.1:8000.
 Pass a Cartup URL:
 
 ```bash
-uv run python scrape.py "https://cartup.com/category/computers__laptops"
+uv run python scrape.py "https://cartup.com/category/sports__outdoors"
 ```
 
 No URL → it prompts:
@@ -55,7 +55,7 @@ No URL → it prompts:
 uv run python scrape.py
 ```
 
-Multiple URLs (dedup is by product URL, across all of them):
+Multiple URLs run one after another in the order given, all deduped by product URL against the same `products` table (a product already saved by an earlier category in the list is skipped when a later category also finds it). Each category prints its own new/updated/skipped counts as it finishes, then a combined total at the end:
 
 ```bash
 uv run python scrape.py "https://cartup.com/category/laptops" "https://cartup.com/category/gaming_laptops"
@@ -79,7 +79,7 @@ Full category scrapes are slow if you fetch every product page. Faster:
 
 ```bash
 # listings only (no product-page HTML) — minutes, not an hour
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --listing-only --workers 16
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --listing-only --workers 16
 ```
 
 The site caps listing pages at 30 items. The scraper patches that in, clicks Load More, and strips old cards so Chrome does not die around 6k items. Product details still mean one HTML request per product; `--workers 16` is the default.
@@ -89,11 +89,11 @@ For big categories (10k-30k+ items), listing collection auto-speeds-up: after th
 ## Flags
 
 ```bash
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --listing-only
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --max-products 50
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --workers 8 --delay 0.08
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --headful
-uv run python scrape.py "https://cartup.com/category/computers__laptops" --refresh
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --listing-only
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --max-products 50
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --workers 8 --delay 0.08
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --headful
+uv run python scrape.py "https://cartup.com/category/sports__outdoors" --refresh
 ```
 
 | Flag | Default | |
