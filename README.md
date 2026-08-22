@@ -17,6 +17,29 @@ DB_PASSWORD=
 
 The database and the `products` table are created automatically on first run if they don't exist yet — no migration step needed. `url` is the unique key, so a product can never end up duplicated in the table. By default, a product already saved is left alone on a later run (same as the old CSV skipping already-scraped URLs) — pass `--refresh` if you want to re-fetch and update it instead.
 
+## Docker
+
+One container runs both the API and the built UI — that's the whole point of `server.py` serving `web/dist` itself, no separate frontend server needed.
+
+```bash
+cp .env.example .env   # first time only; fill in your real DB credentials
+docker compose up --build
+```
+
+Open http://localhost:8088. Ctrl+C stops it; `docker compose up -d` runs it detached. (Port `8088`, not the more common `8000`/`8080`, specifically to stay out of the way of other projects on the same machine — change the `"8088:8088"` mapping in `docker-compose.yml` if you need a different one.)
+
+By default this connects to the **MySQL already running on your machine** (`host.docker.internal`, mapped to your host via `extra_hosts` in `docker-compose.yml`) — your existing data stays exactly where it is, nothing to migrate. Only `DB_HOST` is forced to `host.docker.internal`; every other `DB_*` value comes from your `.env` same as running it directly.
+
+If the container can't reach MySQL, check in this order:
+
+1. **Is MySQL actually running?** `docker exec <container> uv run python -c "from scrap_ecommerce import db; db.get_connection()"` gives the real error. "Connection refused" means nothing is listening — start your MySQL server, same as you'd need to for running this outside Docker.
+2. **`bind-address`**: if your MySQL config binds to `127.0.0.1` only, it refuses connections from anywhere but true loopback — `host.docker.internal` doesn't count as loopback from MySQL's point of view, even though it reaches your machine correctly. Bind it to `0.0.0.0` (or your LAN interface) instead.
+3. **User host grants**: `'root'@'localhost'` (MySQL's common default) only matches connections that claim to be from `localhost` — a container connects as a different apparent host. You may need `CREATE USER 'root'@'%' IDENTIFIED BY '...'; GRANT ALL ON scrap_ecommerce.* TO 'root'@'%'; FLUSH PRIVILEGES;` (adjust user/password to match your setup).
+
+(One thing you *won't* hit: some Docker setups map `host.docker.internal` to both an IPv4 and a non-routable IPv6 address, which would otherwise surface as a confusing "Network is unreachable" — the app resolves to IPv4 explicitly before connecting, so that's handled already.)
+
+Rebuild after changing Python or frontend source (`docker compose build`); no rebuild needed for `.env` changes, just `docker compose up` again.
+
 ## UI
 
 React app in `web/`. Terminal 1 starts the API, terminal 2 starts the UI:
@@ -39,7 +62,7 @@ Open http://localhost:5173 — paste one or more Cartup URLs (one per line), cli
 cd web && npm run build
 ```
 
-Then `uv run scrape-ui` also serves the built UI at http://127.0.0.1:8000.
+Then `uv run scrape-ui` also serves the built UI at http://127.0.0.1:8088 (override with the `PORT` env var, e.g. `PORT=9000 uv run scrape-ui`).
 
 ## Scrape
 
@@ -107,3 +130,21 @@ uv run python scrape.py "https://cartup.com/category/sports__outdoors" --refresh
 | `--refresh` | off | Re-fetch and update products already saved instead of skipping them |
 
 Category pages with ~16k items take a while: listings first (Load More), then one request per product page.
+
+
+### Category URLS are
+
+- https://cartup.com/category/men_530
+- https://cartup.com/category/computers__laptops
+- https://cartup.com/category/furniture
+- https://cartup.com/category/Groceries_20251127074323
+- https://cartup.com/category/health__beauty
+- https://cartup.com/category/women_911
+- https://cartup.com/category/home_appliances
+- https://cartup.com/category/stationery__craft
+- https://cartup.com/category/mobile_accessories
+- https://cartup.com/category/watches
+- https://cartup.com/category/sports__outdoors
+- https://cartup.com/category/mother__baby
+- https://cartup.com/category/motors
+- https://cartup.com/category/mobiles__tablets

@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8088:8088"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Overrides .env's DB_HOST: from inside the container, 127.0.0.1 is the
+      # container itself, not your machine. host.docker.internal reaches the host,
+      # where your existing MySQL (and its data) already lives — nothing to migrate.
+      DB_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  default:
+    # This project has no use for IPv6 between its own containers. (The separate
+    # host.docker.internal-prefers-a-dead-IPv6-route issue is handled in
+    # db.py's _resolve_ipv4 — that mapping comes from Docker's host-gateway
+    # feature, not from this network, so it isn't affected by this setting.)
+    enable_ipv6: false
