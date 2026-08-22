@@ -236,6 +236,13 @@ if WEB_DIST.exists():
 
 
 def main() -> None:
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+    # Defaults to loopback-only for local dev (matches prior behavior exactly).
+    # The Docker image sets HOST=0.0.0.0 — a container's published port can't reach
+    # a server bound only to its own 127.0.0.1.
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8088"))
+    uvicorn.run(app, host=host, port=port, log_level="info")

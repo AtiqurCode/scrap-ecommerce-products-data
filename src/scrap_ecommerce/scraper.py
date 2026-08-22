@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import random
 import re
 import threading
@@ -24,6 +25,17 @@ USER_AGENT = (
 LISTING_PAGE_CAP = 30
 _MAX_REDIRECTS = 5
 _thread_local = threading.local()
+
+
+def _chromium_launch_args() -> list[str]:
+    args = ["--disable-blink-features=AutomationControlled"]
+    # Chromium refuses to run its sandbox as root (the default user in most container
+    # images, including the one this project ships) — --no-sandbox is the standard,
+    # documented fix. Only added when actually running as root, so a normal local
+    # install (Windows/macOS/non-root Linux) is unaffected.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")
+    return args
 
 PRUNE_CARDS_JS = """
 () => {
@@ -741,16 +753,17 @@ class CartupScraper:
         captured_reqs: list[dict[str, Any]] = []
 
         with sync_playwright() as pw:
+            launch_args = _chromium_launch_args()
             try:
                 browser = pw.chromium.launch(
                     channel="chrome",
                     headless=not self.headful,
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=launch_args,
                 )
             except Exception:
                 browser = pw.chromium.launch(
                     headless=not self.headful,
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=launch_args,
                 )
             context = browser.new_context(
                 user_agent=USER_AGENT,

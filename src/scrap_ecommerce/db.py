@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -163,9 +164,24 @@ def _coerce_value(col: str, val: Any) -> Any:
     return text if text != "" else None
 
 
+def _resolve_ipv4(host: str) -> str:
+    """Some Docker setups (Docker Desktop's host.docker.internal in particular) map
+    one hostname to both an IPv4 and an IPv6 address where the IPv6 route isn't
+    actually functional end to end. pymysql doesn't retry the next address if the
+    first one it tries fails, so if the OS/resolver happens to prefer the dead IPv6
+    path (common per RFC 6724), every connection fails with "Network is unreachable"
+    even though the working IPv4 address was right there. Resolving to IPv4
+    ourselves sidesteps that ordering entirely. Falls back to the original string on
+    any resolution failure (e.g. it's already a literal IP) so this can only help."""
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except Exception:
+        return host
+
+
 def _connect(database: str | None = DB_DATABASE) -> pymysql.connections.Connection:
     return pymysql.connect(
-        host=DB_HOST,
+        host=_resolve_ipv4(DB_HOST),
         port=DB_PORT,
         user=DB_USERNAME,
         password=DB_PASSWORD,
